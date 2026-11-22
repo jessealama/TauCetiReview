@@ -17,7 +17,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "runner"
 import grok_billing  # noqa: E402
 import reviewers  # noqa: E402
 import review  # noqa: E402
-from test_grok import _END, _READ_TOOLS_EVENT, _run_rubric, _stream, private_dir  # noqa: E402
+from test_grok import _END, _READ_TOOLS_EVENT, _run_rubric, _stream, fake_grok_env, private_dir  # noqa: E402
 
 UTC = datetime.timezone.utc
 START = datetime.datetime(2026, 11, 16, tzinfo=UTC)
@@ -295,7 +295,15 @@ def test_grok_runs_from_a_staged_link_so_the_real_grok_home_is_denied_whole():
         # ...and the profile denies the real ~/.grok as a whole, so later-created files are covered.
         text = reviewers.grok_sandbox_toml(rev, real_home=real_home)
         assert json.dumps(os.path.join(real_home, ".grok")) in text.split("deny = ", 1)[1]
-        assert reviewers.grok_stage_exe({"HOME": rev, "PATH": "/nonexistent"}) == "grok"
+        # Re-staging replaces the link instead of writing through it.
+        assert reviewers.grok_stage_exe(env) == staged and os.path.samefile(staged, binary)
+        # A miss, or a grok reachable only through a relative PATH entry, is an error, not bare "grok".
+        for path in ("/nonexistent", "", os.path.relpath(os.path.join(real_home, ".grok", "bin"))):
+            try:
+                reviewers.grok_stage_exe({"HOME": rev, "PATH": path})
+                assert False, path
+            except FileNotFoundError:
+                pass
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -326,7 +334,7 @@ def _run_in(checkout, sh):
     original = reviewers.sh
     reviewers.sh = sh
     try:
-        return reviewers.run_grok("PROMPT", checkout, "grok-4.7", {"HOME": home})
+        return reviewers.run_grok("PROMPT", checkout, "grok-4.7", fake_grok_env(home))
     finally:
         reviewers.sh = original
         shutil.rmtree(home, ignore_errors=True)
@@ -373,6 +381,20 @@ def test_scratch_only_writes_do_not_trip_the_integrity_check():
         shutil.rmtree(checkout, ignore_errors=True)
 
 
+def test_missing_grok_is_a_failed_attempt_not_a_bare_lookup():
+    calls = []
+    home, checkout = private_dir(), private_dir()
+    original = reviewers.sh
+    reviewers.sh = lambda cmd, **kw: calls.append(cmd)
+    try:
+        out = reviewers.run_grok("PROMPT", checkout, "grok-4.7", {"HOME": home, "PATH": "."})
+    finally:
+        reviewers.sh = original
+        shutil.rmtree(home, ignore_errors=True)
+        shutil.rmtree(checkout, ignore_errors=True)
+    assert not calls and out["is_error"] and "stage the grok executable" in out["error_message"], out
+
+
 def test_checkout_under_a_strict_writable_root_is_refused_before_any_run():
     calls = []
 
@@ -412,7 +434,7 @@ def test_own_credential_in_output_fails_closed_and_drops_everything():
         reviewers.sh = lambda cmd, **kw: types.SimpleNamespace(returncode=0, stdout=stream, stderr="")
         try:
             out = reviewers.run_grok("PROMPT", checkout, "grok-4.7",
-                                     {"HOME": home, "GROK_HOME": os.path.join(home, ".grok")})
+                                     dict(fake_grok_env(home), GROK_HOME=os.path.join(home, ".grok")))
         finally:
             reviewers.sh = original
         assert out["is_error"] and out["error_message"] == reviewers.GROK_CREDENTIAL_IN_OUTPUT, out

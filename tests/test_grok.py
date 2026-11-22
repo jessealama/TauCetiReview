@@ -33,6 +33,21 @@ def private_dir():
     return tempfile.mkdtemp(dir=base)
 
 
+_FAKE_GROK_DIR = None
+
+
+def fake_grok_env(home):
+    """A reviewer env whose PATH holds a fixture `grok` executable (never run: `sh` is faked)."""
+    global _FAKE_GROK_DIR
+    if _FAKE_GROK_DIR is None:
+        _FAKE_GROK_DIR = private_dir()
+        exe = os.path.join(_FAKE_GROK_DIR, "grok")
+        with open(exe, "w") as f:
+            f.write("#!/bin/sh\nexit 99\n")
+        os.chmod(exe, 0o755)
+    return {"HOME": home, "PATH": _FAKE_GROK_DIR}
+
+
 def _stream(*events):
     return "\n".join(json.dumps(e) for e in events) + "\n"
 
@@ -69,7 +84,7 @@ def _run(stdout, returncode=0, stderr="", prompt="PROMPT"):
     original = reviewers.sh
     reviewers.sh = fake_sh
     try:
-        out = reviewers.run_grok(prompt, repo, "grok-4.7", {"HOME": home})
+        out = reviewers.run_grok(prompt, repo, "grok-4.7", fake_grok_env(home))
     finally:
         reviewers.sh = original
         shutil.rmtree(home, ignore_errors=True)
@@ -86,7 +101,8 @@ def _flag(cmd, flag):
 def test_run_grok_command_shape():
     out, cap = _run(_stream(_READ_TOOLS_EVENT, {"type": "text", "data": "ok"}, _END))
     cmd = cap["cmd"]
-    assert os.path.basename(cmd[0]) == "grok" and cmd[1] == "--prompt-file", cmd
+    # The staged link inside the throwaway GROK_HOME, never a bare `grok` looked up again at launch.
+    assert cmd[0] == os.path.join(cap["home"], ".grok", "bin", "grok") and cmd[1] == "--prompt-file", cmd
     # Inside the throwaway GROK_HOME: readable under strict, and gone with the rev home.
     assert os.path.commonpath([cap["prompt_path"], cap["home"]]) == cap["home"]
     assert os.path.dirname(cap["prompt_path"]) == os.path.join(cap["home"], ".grok")
@@ -341,7 +357,7 @@ def _violating_runner(calls):
                                                                 stderr="progress chatter")
         home = tempfile.mkdtemp()
         try:
-            return reviewers.run_grok(prompt, cwd, model, {"HOME": home})
+            return reviewers.run_grok(prompt, cwd, model, fake_grok_env(home))
         finally:
             reviewers.sh = original
             shutil.rmtree(home, ignore_errors=True)

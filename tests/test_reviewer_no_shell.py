@@ -24,6 +24,7 @@ Exit 0 = all assertions hold; 1 = a mismatch.
 
 import pathlib
 import sys
+import os
 import tempfile
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "runner"))
@@ -84,7 +85,12 @@ def grok_argv():
     reviewers.sh = lambda argv, **kw: (seen.update(argv=list(argv)), R)[1]
     try:
         with tempfile.TemporaryDirectory() as home:
-            reviewers.run_grok("prompt", ".", "grok-4.7", {"HOME": home})
+            bindir = os.path.join(home, "fixture-bin")  # a never-run `grok` for run_grok to stage
+            os.makedirs(bindir)
+            with open(os.path.join(bindir, "grok"), "w") as f:
+                f.write("#!/bin/sh\nexit 99\n")
+            os.chmod(os.path.join(bindir, "grok"), 0o755)
+            reviewers.run_grok("prompt", ".", "grok-4.7", {"HOME": home, "PATH": bindir})
     finally:
         reviewers.sh = orig
     return seen["argv"]

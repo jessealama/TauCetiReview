@@ -2,7 +2,7 @@
 
 Run as a script (runner/ on sys.path), so imports are flat siblings, not package-relative."""
 
-import json, os, pathlib, re, shutil, sqlite3, subprocess, sys, tempfile, time
+import errno, json, os, pathlib, re, shutil, sqlite3, subprocess, sys, tempfile, time
 from contextlib import closing
 from urllib.parse import quote
 
@@ -778,22 +778,34 @@ def _toml_str(s):
 
 def grok_stage_exe(env):
     """Hard-link (or copy) the real `grok` binary into the throwaway GROK_HOME/bin and return that
-    path, so the sandbox can deny the runner's real ~/.grok WHOLE: the official installer keeps the
-    binary at ~/.grok/downloads behind ~/.local/bin and ~/.grok/bin symlinks, and a deny over it
-    leaves bwrap unable to exec grok. A hard link shares the inode, which the path-level deny does not
-    mask. Returns plain "grok" when it is not on PATH (the run then fails as before)."""
-    exe = shutil.which("grok", path=env.get("PATH", ""))  # the reviewer env only, never os.environ
+    absolute path, so the sandbox can deny the runner's real ~/.grok WHOLE: the official installer
+    keeps the binary at ~/.grok/downloads behind ~/.local/bin and ~/.grok/bin symlinks, and a deny
+    over it leaves bwrap unable to exec grok. A hard link shares the inode, which the path-level deny
+    does not mask.
+
+    Only ABSOLUTE entries of the reviewer env's PATH are searched (never os.environ, never a relative
+    entry: the launch CWD links into the untrusted checkout), and a miss raises FileNotFoundError
+    rather than falling back to a bare `grok` that the launch would look up again."""
+    search = os.pathsep.join(d for d in (env.get("PATH") or "").split(os.pathsep) if os.path.isabs(d))
+    exe = shutil.which("grok", path=search) if search else None
     if not exe:
-        return "grok"
+        raise FileNotFoundError("`grok` is not on the reviewer's PATH (absolute entries only)")
     real = os.path.realpath(exe)
     grok_home = env.get("GROK_HOME") or os.path.join(env["HOME"], ".grok")
     bindir = os.path.join(grok_home, "bin")
     os.makedirs(bindir, exist_ok=True)
     staged = os.path.join(bindir, "grok")
+    if os.path.lexists(staged):
+        os.unlink(staged)  # never write through a stale link or symlink
     try:
         os.link(real, staged)
-    except OSError:
-        shutil.copy2(real, staged)
+    except OSError as e:
+        if e.errno not in (errno.EXDEV, errno.EPERM, errno.EMLINK, errno.ENOTSUP):
+            raise
+        # Cross-device (or no hard links): copy into an exclusively created file.
+        fd = os.open(staged, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o700)
+        with os.fdopen(fd, "wb") as dst, open(real, "rb") as src:
+            shutil.copyfileobj(src, dst)
     return staged
 
 
@@ -912,6 +924,11 @@ def run_grok(prompt, cwd, model, env):
         return {"returncode": 1, "text": "", "is_error": True, "raw_stderr": "", "cost_usd": 0.0,
                 "error_message": (f"{GROK_CHECKOUT_WRITABLE}: {checkout} is under {writable}, which the "
                                   "strict sandbox makes writable; review from a workspace outside it")}
+    try:
+        exe = grok_stage_exe(env)
+    except OSError as e:
+        return {"returncode": 1, "text": "", "is_error": True, "raw_stderr": "", "cost_usd": 0.0,
+                "error_message": f"cannot stage the grok executable: {e}"}
     scratch = grok_scratch(env, checkout)
     before = tree_fingerprint(checkout)
     prompt = (f"The pull request workspace is the read-only directory {checkout}; paths in this "
@@ -921,7 +938,7 @@ def run_grok(prompt, cwd, model, env):
     prompt_file = os.path.join(env.get("GROK_HOME") or os.path.join(env["HOME"], ".grok"), "review-prompt.md")
     with open(prompt_file, "w", encoding="utf-8") as f:
         f.write(prompt)
-    cmd = [grok_stage_exe(env), "--prompt-file", prompt_file,
+    cmd = [exe, "--prompt-file", prompt_file,
            "-m", model,
            "--output-format", "streaming-json",
            "--tools", ",".join(GROK_READ_TOOLS),
