@@ -156,6 +156,36 @@ GROK_ENV = {
 # runaway loop.
 GROK_MAX_TURNS = 200
 
+# The kernel sandbox a grok review runs under: a custom profile written into the reviewer's own
+# throwaway GROK_HOME/sandbox.toml for each attempt (Grok Build docs, 18-sandbox.md).
+#
+# Built-in `--sandbox strict` alone is not enough for a reviewer: it lets the process write its CWD
+# (and /tmp, /var/tmp), so run from the checkout it could modify the very tree it is reviewing, and
+# its reads are scoped to "CWD + system paths + GROK_HOME". A custom profile's `read_only` and
+# `read_write` entries only ADD grants; they cannot take write access away from a path the base
+# already grants. So the review runs from an EMPTY scratch directory inside the throwaway HOME (the
+# only CWD it can write), and the checkout is granted read-only. Top-level symlinks in the scratch
+# directory keep the prompt's checkout-relative paths (code/..., roadmap/...) resolving.
+#
+# Defence in depth, because the default workspace lives under /tmp, which `strict` makes writable:
+# run_grok fingerprints the checkout before and after the run and fails closed if anything changed.
+#
+# A custom profile also fails closed where `strict` does not: if it cannot be applied (unknown
+# profile, malformed sandbox.toml, no bubblewrap for a non-empty deny on Linux) Grok refuses to start
+# instead of warning and running unsandboxed.
+GROK_SANDBOX_PROFILE = "tauceti-review"
+
+# The runner's own credential stores, kernel-denied (read and write) if they exist. `strict` does not
+# grant the real HOME anyway; these are belt-and-braces against a checkout or system path that
+# overlaps them. Literal paths only: on Linux a deny glob is expanded once at launch and a glob over a
+# large tree (Mathlib) can make Grok refuse to start, and a literal deny that does not exist cannot be
+# bound, so only existing paths are listed.
+GROK_DENY_HOME_PATHS = (".ssh", ".aws", ".azure", ".gnupg", ".netrc", ".git-credentials", ".docker",
+                        ".npmrc", ".pypirc", ".kube", ".config/gh", ".config/gcloud", ".claude",
+                        ".codex", ".grok", ".kiro", ".hermes", ".cursor", ".local/share/kiro-cli")
+
+GROK_CHECKOUT_CHANGED = "grok's sandbox let the checkout change during the review"
+
 
 def exact_grok_model(model):
     """Return a native Grok model id or reject the dispatch."""
@@ -258,6 +288,11 @@ def reviewer_env(provider, keys, subscription=False):
             dst = os.path.join(grok_home, "auth.json")
             shutil.copyfile(src, dst)
             os.chmod(dst, 0o600)
+            # The env above is built from scratch, so no XAI_API_KEY is inherited; the pop states the
+            # invariant and guards a future change. A logged-in session normally beats the key, but
+            # an explicit key preference or an expired session falls back to it (API billing), and
+            # a subscription review must never bill the API.
+            env.pop("XAI_API_KEY", None)
         else:
             env["XAI_API_KEY"] = (keys.get("xai", "") or "").strip()
     else:
@@ -732,6 +767,55 @@ def run_kiro(prompt, cwd, model, env):
     return out
 
 
+def _toml_str(s):
+    """A TOML basic string (json.dumps escapes are a valid subset for the paths we write)."""
+    return json.dumps(str(s))
+
+
+def grok_sandbox_toml(checkout, real_home=None):
+    """The `tauceti-review` profile: base `strict`, child network off, checkout read-only, the
+    runner's existing credential paths denied."""
+    real_home = real_home or os.path.expanduser("~")
+    deny = [os.path.join(real_home, p) for p in GROK_DENY_HOME_PATHS
+            if os.path.lexists(os.path.join(real_home, p))]
+    lines = [f"[profiles.{GROK_SANDBOX_PROFILE}]", 'extends = "strict"', "restrict_network = true",
+             f"read_only = [{_toml_str(os.path.realpath(checkout))}]",
+             "read_write = []",
+             "deny = [" + ", ".join(_toml_str(d) for d in deny) + "]"]
+    return "\n".join(lines) + "\n"
+
+
+def grok_scratch(env, checkout):
+    """Create the empty scratch CWD inside the throwaway HOME, with one symlink per top-level entry
+    of the checkout so checkout-relative paths still resolve. Returns its path."""
+    scratch = os.path.join(env["HOME"], "scratch")
+    os.makedirs(scratch, exist_ok=True)
+    root = os.path.realpath(checkout)
+    for name in sorted(os.listdir(root)):
+        os.symlink(os.path.join(root, name), os.path.join(scratch, name))
+    grok_home = env.get("GROK_HOME") or os.path.join(env["HOME"], ".grok")
+    os.makedirs(grok_home, exist_ok=True)
+    with open(os.path.join(grok_home, "sandbox.toml"), "w", encoding="utf-8") as f:
+        f.write(grok_sandbox_toml(root))
+    return scratch
+
+
+def tree_fingerprint(root):
+    """(relpath, type, size, mtime_ns) for everything under `root`, symlinks not followed. Cheap
+    enough to take twice per attempt; any difference means the review changed the checkout."""
+    out = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames.sort()
+        for name in sorted(dirnames + filenames):
+            p = os.path.join(dirpath, name)
+            try:
+                st = os.lstat(p)
+            except OSError:
+                continue
+            out.append((os.path.relpath(p, root), st.st_mode >> 12, st.st_size, st.st_mtime_ns))
+    return out
+
+
 def run_grok(prompt, cwd, model, env):
     """Run one exact native Grok Build model with read-only filesystem tools.
 
@@ -750,8 +834,18 @@ def run_grok(prompt, cwd, model, env):
     never part of it. Spend comes from the terminal `end` event: cost_usd is computed from
     prices.json per `modelUsage` entry, and grok's own `total_cost_usd` is kept as
     provider_cost_usd for cross-checking, as run_pi does. Without a usable `end` (a killed or
-    truncated run) the summed per-turn `usage` events are priced instead, so the spend is kept."""
+    truncated run) the summed per-turn `usage` events are priced instead, so the spend is kept.
+
+    Sandbox: the run is confined by the GROK_SANDBOX_PROFILE kernel profile, from an empty scratch CWD
+    that links to the checkout's top level, and the checkout is fingerprinted before and after; any
+    change fails the run closed with GROK_CHECKOUT_CHANGED. Credit pacing happens before this is
+    called (review.run_rubric -> grok_billing.check), never here."""
     model = exact_grok_model(model)
+    checkout = os.path.realpath(cwd or ".")
+    scratch = grok_scratch(env, checkout)
+    before = tree_fingerprint(checkout)
+    prompt = (f"The pull request workspace is the read-only directory {checkout}; paths in this "
+              "prompt are relative to it (the current directory links to its top level).\n\n" + prompt)
     prompt_file = os.path.join(env["HOME"], "review-prompt.md")
     with open(prompt_file, "w", encoding="utf-8") as f:
         f.write(prompt)
@@ -762,8 +856,10 @@ def run_grok(prompt, cwd, model, env):
            "--disallowed-tools", ",".join(GROK_DENIED_TOOLS),
            "--disable-web-search", "--no-subagents", "--no-plan", "--no-memory",
            "--permission-mode", "dontAsk",
+           "--sandbox", GROK_SANDBOX_PROFILE,
            "--max-turns", str(GROK_MAX_TURNS)]
-    r = sh(cmd, cwd=cwd, env=env)
+    r = sh(cmd, cwd=scratch, env=env)
+    checkout_changed = tree_fingerprint(checkout) != before
     out = {"returncode": r.returncode, "raw_stderr": r.stderr[-3000:]}
     parts, end, err = [], None, None
     turn_usage = {}  # summed per-turn `usage` events: the spend record when `end` never arrives
@@ -847,7 +943,9 @@ def run_grok(prompt, cwd, model, env):
         out["price_inherited"] = inherited
     if isinstance(fin.get("total_cost_usd"), (int, float)) and not isinstance(fin["total_cost_usd"], bool):
         out["provider_cost_usd"] = round(fin["total_cost_usd"], 6)
-    if unexpected:
+    if checkout_changed:
+        err = GROK_CHECKOUT_CHANGED
+    elif unexpected:
         err = f"{GROK_TOOL_VIOLATION}: " + ", ".join(sorted(unexpected))
     elif err is None and (malformed_listing or not listed):
         # After a provider `error` event that message is the more useful diagnosis (an auth

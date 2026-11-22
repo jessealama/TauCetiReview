@@ -27,7 +27,8 @@ from pricing import CLAUDE_MODEL, CODEX_FALLBACK_MODEL, CODEX_MODEL, GROK_MODEL,
 from pricing import PRICES, _PRICE_WINDOWS, dispatch_models  # noqa: F401
 from verdict import extract_verdict, has_new_contest, is_blocking, is_unresolved, newest_reply_id, overall_label, posts_review_thread, state_of, today
 from merge import changed_paths, decide_merge, read_paths
-from reviewers import GROK_TOOL_VIOLATION, build_prompt, ci_status_block, cleanup_rev_home, codex_model_unavailable, exact_grok_model, exact_kiro_model, reject_retired_opus, reviewer_env, run_claude, run_codex, run_grok, run_kiro, run_pi, sweep_rev_homes
+import grok_billing
+from reviewers import GROK_CHECKOUT_CHANGED, GROK_TOOL_VIOLATION, build_prompt, ci_status_block, cleanup_rev_home, codex_model_unavailable, exact_grok_model, exact_kiro_model, reject_retired_opus, reviewer_env, run_claude, run_codex, run_grok, run_kiro, run_pi, sweep_rev_homes
 from casefile import (build_reactivation_block, carry_forward, normalize_finding_path, patch_digest,
                       pick_anchor, seed_stale_approvals, update_case_file)
 from render import meta_block, render_contest_reply, render_scoreboard, render_thread, rubrics_fingerprint, thread_meta
@@ -77,7 +78,8 @@ _ERROR_KINDS = (
 
 # Kinds that mean "the provider could not serve ANY rubric right now", as opposed to "this rubric's
 # call went wrong". Every one of them will hit the next rubric identically, so the round is over.
-PROVIDER_DOWN_KINDS = frozenset({"not_authenticated", "quota_exhausted", "rate_limited", "local_admission"})
+PROVIDER_DOWN_KINDS = frozenset({"not_authenticated", "quota_exhausted", "rate_limited", "local_admission",
+                                 "pacing_hold"})
 
 # How many consecutive provider-down rubrics end the round. Two, not one: a single 401 can be a
 # token rotating under a long round, and the retry inside run_rubric already covers the blip. Two in
@@ -95,12 +97,15 @@ _PROVIDER_DOWN_PHRASE = {
     "quota_exhausted": "the provider's subscription window is exhausted",
     "rate_limited": "the provider is rate limiting this account",
     "provider_unavailable": "the review provider is unavailable",
+    "pacing_hold": "the provider's subscription credits are paced out or unreadable",
 }
 
 # Kinds a second attempt cannot fix, so run_rubric does not pay for one. A widened tool set is the
 # runner's configuration (or the CLI's), not a blip: the retry would spend a whole review again only
 # to fail closed again.
-NO_RETRY_KINDS = frozenset({"tool_set_violation"})
+# A pacing hold is the same: the credits will not have recovered seconds later, and an unreadable
+# usage read is a configuration fact. A changed checkout is a sandbox failure, never a blip.
+NO_RETRY_KINDS = frozenset({"tool_set_violation", "pacing_hold", "sandbox_violation"})
 
 # Native CLI failures remain distinct from the model's structured review verdict.
 def _cli_reports_failure(res):
@@ -117,8 +122,13 @@ def error_kind(res):
 
     `tool_set_violation` is read from error_message alone, by the runner's own fixed prefix: it is
     a fact run_grok established from the stream, not something provider text can claim."""
-    if (res.get("error_message") or "").startswith(GROK_TOOL_VIOLATION):
+    msg = res.get("error_message") or ""
+    if msg.startswith(GROK_TOOL_VIOLATION):
         return "tool_set_violation"
+    if msg.startswith(grok_billing.GROK_PACING_HOLD):
+        return "pacing_hold"
+    if msg.startswith(GROK_CHECKOUT_CHANGED):
+        return "sandbox_violation"
     hay = f"{res.get('raw_stderr') or ''}\n{res.get('parse_error') or ''}\n{res.get('error_message') or ''}"
     for kind, pattern in _ERROR_KINDS:
         if pattern.search(hay):
@@ -382,7 +392,22 @@ def run_rubric(ctx, rubric):
                  "raw_stderr": "", "cost_usd": 0.0}
         else:
             try:
-                r = fn(prompt, a.tool_cwd, model, env)
+                # A grok subscription review spends the user's credit pool, so it is paced like the
+                # Worker paces Codex/Claude, read in the same throwaway env the review would use.
+                # Fails closed: unreadable usage or possible on-demand billing is a hold, not a pass.
+                # --auth api is explicit, user-chosen API billing and has no credit pool to pace.
+                hold = None
+                if provider == "grok" and subscription:
+                    ok, hold, pace = grok_billing.check(env)
+                    if ok:
+                        print(f"  grok credits: {pace['percent']}% of the {pace['period']} period used "
+                              f"(pace budget {pace['budget']}%)", file=sys.stderr)
+                        hold = None
+                if hold:
+                    r = {"returncode": 1, "text": "", "is_error": True, "error_message": hold,
+                         "raw_stderr": "", "cost_usd": 0.0}
+                else:
+                    r = fn(prompt, a.tool_cwd, model, env)
             finally:
                 cleanup_rev_home(rev_home)   # throwaway HOME, one per attempt — don't accumulate
         # Keep each attempt's execution facts: the retry path returns only the last result, but the

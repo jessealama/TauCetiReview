@@ -47,6 +47,8 @@ def _run(stdout, returncode=0, stderr="", prompt="PROMPT"):
     """Run run_grok against a faked `sh`, returning (out, captured)."""
     captured = {}
     home = tempfile.mkdtemp()
+    repo = tempfile.mkdtemp()
+    os.makedirs(os.path.join(repo, "code"))
 
     def fake_sh(cmd, **kwargs):
         captured.update(cmd=list(cmd), kwargs=kwargs)
@@ -59,11 +61,13 @@ def _run(stdout, returncode=0, stderr="", prompt="PROMPT"):
     original = reviewers.sh
     reviewers.sh = fake_sh
     try:
-        out = reviewers.run_grok(prompt, "/repo", "grok-4.7", {"HOME": home})
+        out = reviewers.run_grok(prompt, repo, "grok-4.7", {"HOME": home})
     finally:
         reviewers.sh = original
         shutil.rmtree(home, ignore_errors=True)
+        shutil.rmtree(repo, ignore_errors=True)
     captured["home"] = home
+    captured["repo"] = os.path.realpath(repo)
     return out, captured
 
 
@@ -76,7 +80,8 @@ def test_run_grok_command_shape():
     cmd = cap["cmd"]
     assert cmd[:2] == ["grok", "--prompt-file"], cmd
     assert os.path.commonpath([cap["prompt_path"], cap["home"]]) == cap["home"]
-    assert cap["prompt_at_call"] == "PROMPT"
+    assert cap["prompt_at_call"].endswith("\n\nPROMPT")
+    assert cap["repo"] in cap["prompt_at_call"].split("\n\n")[0]
     assert _flag(cmd, "-m") == "grok-4.7"
     assert _flag(cmd, "--output-format") == "streaming-json"
     assert _flag(cmd, "--permission-mode") == "dontAsk"
@@ -84,7 +89,9 @@ def test_run_grok_command_shape():
         assert flag in cmd, flag
     assert int(_flag(cmd, "--max-turns")) > 0
     assert "stdin_text" not in cap["kwargs"]
-    assert cap["kwargs"].get("cwd") == "/repo"
+    # Runs from the empty scratch dir inside the throwaway HOME, never from the checkout.
+    assert cap["kwargs"].get("cwd") == os.path.join(cap["home"], "scratch")
+    assert _flag(cmd, "--sandbox") == reviewers.GROK_SANDBOX_PROFILE
     assert "error_message" not in out and not out.get("is_error")
 
 
@@ -248,8 +255,12 @@ def test_engine_rejects_openrouter_id_for_native_grok():
         sys.argv = old
 
 
-def _run_rubric(runner=None, env_error=None):
-    """Drive review.run_rubric once for a grok rubric with faked seams; return (result, stderr)."""
+_PACED_OK = (True, "", {"percent": 10.0, "period": "weekly", "budget": 40.0})
+
+
+def _run_rubric(runner=None, env_error=None, billing=_PACED_OK):
+    """Drive review.run_rubric once for a grok rubric with faked seams; return (result, stderr).
+    `billing` is what the faked grok_billing.check returns (a tuple), or a callable standing in."""
     import argparse
     import contextlib
     import io
@@ -265,6 +276,8 @@ def _run_rubric(runner=None, env_error=None):
     saved = {n: getattr(review, n) for n in
              ("reviewer_env", "cleanup_rev_home", "build_prompt", "build_reactivation_block",
               "extract_verdict", "update_case_file", "newest_reply_id")}
+    saved_check = review.grok_billing.check
+    review.grok_billing.check = billing if callable(billing) else (lambda env: billing)
     review.reviewer_env = env_fn
     review.cleanup_rev_home = lambda *a, **k: None
     review.build_prompt = lambda *a, **k: "PROMPT"
@@ -273,7 +286,8 @@ def _run_rubric(runner=None, env_error=None):
     review.update_case_file = lambda *a, **k: {"author_replies": []}
     review.newest_reply_id = lambda *a, **k: None
     outdir = pathlib.Path(tempfile.mkdtemp())
-    a = argparse.Namespace(mode="commit", reply_rubric=None, rubrics_dir="/tmp", tool_cwd="/tmp",
+    tool_cwd = tempfile.mkdtemp()  # a private checkout: run_grok fingerprints it before and after
+    a = argparse.Namespace(mode="commit", reply_rubric=None, rubrics_dir="/tmp", tool_cwd=tool_cwd,
                            code_path="code", repo="r", pr=1, archive_dir=None, dry_run=True, arm="production",
                            auth="subscription", submitted_by=None, base_sha=None, merge_base_sha=None,
                            rubrics_repo="rr", rubrics_sha=None, rubrics_sha_approx=None)
@@ -291,6 +305,8 @@ def _run_rubric(runner=None, env_error=None):
     finally:
         for n, v in saved.items():
             setattr(review, n, v)
+        review.grok_billing.check = saved_check
+        shutil.rmtree(tool_cwd, ignore_errors=True)
         if gha is not None:
             os.environ["GITHUB_ACTIONS"] = gha
     return ctx.run_results[0], err.getvalue()
