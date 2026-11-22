@@ -185,6 +185,8 @@ GROK_DENY_HOME_PATHS = (".ssh", ".aws", ".azure", ".gnupg", ".netrc", ".git-cred
                         ".codex", ".grok", ".kiro", ".hermes", ".cursor", ".local/share/kiro-cli")
 
 GROK_CHECKOUT_CHANGED = "grok's sandbox let the checkout change during the review"
+GROK_CHECKOUT_WRITABLE = "grok's sandbox cannot make the checkout read-only"
+GROK_CREDENTIAL_IN_OUTPUT = "grok's output contained its own login credential"
 
 
 def exact_grok_model(model):
@@ -800,8 +802,48 @@ def grok_scratch(env, checkout):
     return scratch
 
 
+def grok_strict_writable_root(checkout, env):
+    """The write grant of `strict` that contains `checkout`, or None.
+
+    A custom profile's `read_only` cannot revoke a base write grant (Landlock grants are additive;
+    xai-grok-sandbox profiles.rs resolves `extends` first and only appends). `strict` writes its CWD,
+    GROK_HOME/sessions and the temp dirs (paths.rs temp_writable_paths: /tmp, /var/tmp, $TMPDIR, and
+    the /private ones on macOS), so a checkout under any of them would stay writable."""
+    roots = ["/tmp", "/var/tmp", "/private/tmp", "/private/var/tmp", "/private/var/folders"]
+    if env.get("TMPDIR"):
+        roots.append(env["TMPDIR"])
+    grok_home = env.get("GROK_HOME") or os.path.join(env["HOME"], ".grok")
+    roots += [os.path.join(grok_home, "sessions"), os.path.join(env["HOME"], "scratch")]
+    for root in roots:
+        real = os.path.realpath(root)
+        if os.path.exists(real) and os.path.commonpath([checkout, real]) == real:
+            return root
+    return None
+
+
+def _grok_credential_strings(env):
+    """Every long string value in the reviewer's copied login file (tokens), for leak detection.
+    Never logged or returned anywhere else."""
+    path = os.path.join(env.get("GROK_HOME") or os.path.join(env["HOME"], ".grok"), "auth.json")
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return set()
+    out, stack = set(), [data]
+    while stack:
+        v = stack.pop()
+        if isinstance(v, dict):
+            stack.extend(v.values())
+        elif isinstance(v, list):
+            stack.extend(v)
+        elif isinstance(v, str) and len(v) >= 24:
+            out.add(v)
+    return out
+
+
 def tree_fingerprint(root):
-    """(relpath, type, size, mtime_ns) for everything under `root`, symlinks not followed. Cheap
+    """(relpath, mode, size, mtime_ns) for everything under `root`, symlinks not followed. Cheap
     enough to take twice per attempt; any difference means the review changed the checkout."""
     out = []
     for dirpath, dirnames, filenames in os.walk(root):
@@ -812,7 +854,7 @@ def tree_fingerprint(root):
                 st = os.lstat(p)
             except OSError:
                 continue
-            out.append((os.path.relpath(p, root), st.st_mode >> 12, st.st_size, st.st_mtime_ns))
+            out.append((os.path.relpath(p, root), st.st_mode, st.st_size, st.st_mtime_ns))
     return out
 
 
@@ -842,11 +884,18 @@ def run_grok(prompt, cwd, model, env):
     called (review.run_rubric -> grok_billing.check), never here."""
     model = exact_grok_model(model)
     checkout = os.path.realpath(cwd or ".")
+    writable = grok_strict_writable_root(checkout, env)
+    if writable:
+        return {"returncode": 1, "text": "", "is_error": True, "raw_stderr": "", "cost_usd": 0.0,
+                "error_message": (f"{GROK_CHECKOUT_WRITABLE}: {checkout} is under {writable}, which the "
+                                  "strict sandbox makes writable; review from a workspace outside it")}
     scratch = grok_scratch(env, checkout)
     before = tree_fingerprint(checkout)
     prompt = (f"The pull request workspace is the read-only directory {checkout}; paths in this "
               "prompt are relative to it (the current directory links to its top level).\n\n" + prompt)
-    prompt_file = os.path.join(env["HOME"], "review-prompt.md")
+    # In GROK_HOME, which `strict` grants read (not write): the sandbox is applied before grok opens
+    # --prompt-file, and the throwaway HOME's root is not readable under it.
+    prompt_file = os.path.join(env.get("GROK_HOME") or os.path.join(env["HOME"], ".grok"), "review-prompt.md")
     with open(prompt_file, "w", encoding="utf-8") as f:
         f.write(prompt)
     cmd = ["grok", "--prompt-file", prompt_file,
@@ -858,8 +907,17 @@ def run_grok(prompt, cwd, model, env):
            "--permission-mode", "dontAsk",
            "--sandbox", GROK_SANDBOX_PROFILE,
            "--max-turns", str(GROK_MAX_TURNS)]
+    secrets_before = _grok_credential_strings(env)
     r = sh(cmd, cwd=scratch, env=env)
     checkout_changed = tree_fingerprint(checkout) != before
+    # `strict` must let grok read its own GROK_HOME (and so the copied OAuth login), so a
+    # prompt-injected run could read the token and put it in a verdict that gets published. Grok
+    # cannot be denied its own login, so this is detected instead: any credential string in the
+    # output fails the run closed and drops the output entirely.
+    secrets_now = secrets_before | _grok_credential_strings(env)
+    leaked = any(sec in r.stdout or sec in r.stderr for sec in secrets_now)
+    if leaked:
+        r.stdout, r.stderr = "", ""  # nothing of this run may be kept, not even as a debug tail
     out = {"returncode": r.returncode, "raw_stderr": r.stderr[-3000:]}
     parts, end, err = [], None, None
     turn_usage = {}  # summed per-turn `usage` events: the spend record when `end` never arrives
@@ -943,7 +1001,9 @@ def run_grok(prompt, cwd, model, env):
         out["price_inherited"] = inherited
     if isinstance(fin.get("total_cost_usd"), (int, float)) and not isinstance(fin["total_cost_usd"], bool):
         out["provider_cost_usd"] = round(fin["total_cost_usd"], 6)
-    if checkout_changed:
+    if leaked:
+        err = GROK_CREDENTIAL_IN_OUTPUT
+    elif checkout_changed:
         err = GROK_CHECKOUT_CHANGED
     elif unexpected:
         err = f"{GROK_TOOL_VIOLATION}: " + ", ".join(sorted(unexpected))

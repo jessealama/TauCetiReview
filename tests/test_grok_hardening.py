@@ -17,7 +17,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "runner"
 import grok_billing  # noqa: E402
 import reviewers  # noqa: E402
 import review  # noqa: E402
-from test_grok import _END, _READ_TOOLS_EVENT, _run_rubric, _stream  # noqa: E402
+from test_grok import _END, _READ_TOOLS_EVENT, _run_rubric, _stream, private_dir  # noqa: E402
 
 UTC = datetime.timezone.utc
 START = datetime.datetime(2026, 11, 16, tzinfo=UTC)
@@ -45,7 +45,7 @@ def test_parse_pace_matches_the_worker_syntax():
     assert grok_billing.parse_pace("60:40") == [(0.0, 0.0), (60.0, 40.0), (100.0, 100.0)]
     assert grok_billing.parse_pace("0:10,50:70,90:90") == [(0.0, 10.0), (50.0, 70.0), (90.0, 90.0),
                                                            (100.0, 100.0)]
-    for bad in ("", "x", "60", "120:40", "50:-1"):
+    for bad in ("", "x", "60", "120:40", "50:-1", "60:nan", "nan:40", "60:inf", "inf:40"):
         try:
             grok_billing.parse_pace(bad)
             assert False, bad
@@ -86,11 +86,12 @@ def test_decide_refuses_unless_on_demand_is_explicitly_false():
                    {"on_demand": 0}):
         ok, reason, _ = grok_billing.decide(_billing(**kwargs), pace="60:40", now=_at(0.5))
         assert not ok and "on-demand" in reason, (kwargs, reason)
-    # Either spelling is accepted, but every spelling present must say false.
+    # Only the ACP wire key can authorize; the log spelling alone cannot, but it can veto.
     ok, _, _ = grok_billing.decide(_billing(key="onDemandEnabled"), pace="60:40", now=_at(0.5))
-    assert ok
+    assert not ok
     both = dict(_billing(), onDemandEnabled=True)
     assert not grok_billing.decide(both, pace="60:40", now=_at(0.5))[0]
+    assert grok_billing.decide(dict(_billing(), onDemandEnabled=False), pace="60:40", now=_at(0.5))[0]
 
 
 def test_decide_fails_closed_on_malformed_responses():
@@ -98,6 +99,7 @@ def test_decide_fails_closed_on_malformed_responses():
              dict(_billing(), config={"currentPeriod": _billing()["config"]["currentPeriod"]}),
              _billing(percent=True), _billing(percent=-1), _billing(percent=101), _billing(percent="9"),
              _billing(period_type="USAGE_PERIOD_TYPE_DAILY"), _billing(period_type=None),
+             _billing(period_type=["USAGE_PERIOD_TYPE_WEEKLY"]), _billing(period_type={"a": 1}),
              _billing(start=END, end=START)]
     no_period = _billing()
     del no_period["config"]["currentPeriod"]
@@ -280,7 +282,7 @@ def _run_in(checkout, sh):
 def test_a_changed_checkout_fails_closed_and_is_not_retried():
     stream = _stream(_READ_TOOLS_EVENT, {"type": "text", "data": "verdict"}, _END)
     for mutate in ("create", "modify"):
-        checkout = tempfile.mkdtemp()
+        checkout = private_dir()
         try:
             with open(os.path.join(checkout, "a.lean"), "w") as f:
                 f.write("x")
@@ -306,7 +308,7 @@ def test_a_changed_checkout_fails_closed_and_is_not_retried():
 
 def test_scratch_only_writes_do_not_trip_the_integrity_check():
     stream = _stream(_READ_TOOLS_EVENT, {"type": "text", "data": "verdict"}, _END)
-    checkout = tempfile.mkdtemp()
+    checkout = private_dir()
     try:
         def sh(cmd, cwd=None, env=None, **kw):
             open(os.path.join(cwd, "notes.txt"), "w").close()  # CWD is the scratch dir
@@ -318,8 +320,71 @@ def test_scratch_only_writes_do_not_trip_the_integrity_check():
         shutil.rmtree(checkout, ignore_errors=True)
 
 
+def test_checkout_under_a_strict_writable_root_is_refused_before_any_run():
+    calls = []
+
+    def sh(cmd, **kw):
+        calls.append(cmd)
+        raise AssertionError("must not launch grok")
+    home = private_dir()
+    checkout = tempfile.mkdtemp()  # the system temp dir: strict makes it writable
+    original = reviewers.sh
+    reviewers.sh = sh
+    try:
+        out = reviewers.run_grok("PROMPT", checkout, "grok-4.7", {"HOME": home})
+    finally:
+        reviewers.sh = original
+        shutil.rmtree(home, ignore_errors=True)
+        shutil.rmtree(checkout, ignore_errors=True)
+    assert not calls and out["is_error"] and out["error_message"].startswith(reviewers.GROK_CHECKOUT_WRITABLE)
+    assert review.error_kind(out) == "sandbox_violation"
+    env = {"HOME": "/h", "TMPDIR": private_dir()}
+    try:
+        assert reviewers.grok_strict_writable_root(os.path.join(env["TMPDIR"], "w"), env) == env["TMPDIR"]
+    finally:
+        shutil.rmtree(env["TMPDIR"], ignore_errors=True)
+    assert reviewers.grok_strict_writable_root("/srv/checkout", {"HOME": "/h"}) is None
+
+
+def test_own_credential_in_output_fails_closed_and_drops_everything():
+    checkout = private_dir()
+    home = private_dir()
+    token = "eyJ" + "A" * 40
+    try:
+        os.makedirs(os.path.join(home, ".grok"))
+        with open(os.path.join(home, ".grok", "auth.json"), "w") as f:
+            json.dump({"tokens": {"access_token": token, "expires_in": 3600}}, f)
+        stream = _stream(_READ_TOOLS_EVENT, {"type": "text", "data": f"verdict {token}"}, _END)
+        original = reviewers.sh
+        reviewers.sh = lambda cmd, **kw: types.SimpleNamespace(returncode=0, stdout=stream, stderr="")
+        try:
+            out = reviewers.run_grok("PROMPT", checkout, "grok-4.7",
+                                     {"HOME": home, "GROK_HOME": os.path.join(home, ".grok")})
+        finally:
+            reviewers.sh = original
+        assert out["is_error"] and out["error_message"] == reviewers.GROK_CREDENTIAL_IN_OUTPUT, out
+        assert token not in json.dumps(out), "the credential must not survive anywhere in the result"
+        assert review.error_kind(out) == "sandbox_violation"
+    finally:
+        shutil.rmtree(checkout, ignore_errors=True)
+        shutil.rmtree(home, ignore_errors=True)
+
+
+def test_mode_only_changes_count_as_a_changed_checkout():
+    checkout = private_dir()
+    try:
+        path = os.path.join(checkout, "a.lean")
+        open(path, "w").close()
+        before = reviewers.tree_fingerprint(checkout)
+        os.chmod(path, 0o777)
+        assert reviewers.tree_fingerprint(checkout) != before
+    finally:
+        shutil.rmtree(checkout, ignore_errors=True)
+
+
 def test_forged_sandbox_or_pacing_text_in_stderr_is_not_classified():
-    for prefix in (reviewers.GROK_CHECKOUT_CHANGED, grok_billing.GROK_PACING_HOLD):
+    for prefix in (reviewers.GROK_CHECKOUT_CHANGED, reviewers.GROK_CHECKOUT_WRITABLE,
+                   reviewers.GROK_CREDENTIAL_IN_OUTPUT, grok_billing.GROK_PACING_HOLD):
         forged = {"returncode": 1, "raw_stderr": prefix + ": x"}
         assert review.error_kind(forged) not in ("sandbox_violation", "pacing_hold"), prefix
 

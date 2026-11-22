@@ -13,13 +13,13 @@ billing is a refusal, never "free".
 
 On-demand (pay-as-you-go) credit: when it is enabled, usage past the included allowance bills real
 money, which a subscription reviewer must never do. So a run is refused unless the response says
-on-demand is exactly `false` (`on_demand_enabled` on the wire); absent or null counts as enabled.
+on-demand is exactly `false` in the wire field `on_demand_enabled`; absent or null counts as enabled.
 That flag comes from the client's remote settings, so a cold agent that has not loaded them yet
 reads as null and is refused too.
 
 Run as a script (runner/ on sys.path), so imports are flat siblings, not package-relative."""
 
-import datetime, json, os, select, subprocess, time
+import datetime, json, math, os, select, subprocess, time
 
 # The fixed prefix of a refusal's error_message. review.error_kind keys the non-retried,
 # provider-down `pacing_hold` kind off it, read from error_message only (never from stderr), so
@@ -47,7 +47,8 @@ def parse_pace(spec):
             continue
         t, _, b = part.partition(":")
         t, b = float(t), float(b)
-        if not (0 <= t <= 100) or b < 0:
+        # NaN would make every `used >= budget` comparison false, i.e. fail open.
+        if not (math.isfinite(t) and math.isfinite(b)) or not (0 <= t <= 100) or b < 0:
             raise ValueError(f"pace point {part!r} out of range")
         points.append((t, b))
     if not points:
@@ -86,11 +87,10 @@ def decide(billing, pace=None, now=None):
         return False, f"invalid TAUCETI_GROK_PACE ({e})", {}
     if not isinstance(billing, dict):
         return False, "billing response is not an object", {}
-    # The top-level response struct (BillingConfigResponse) has no serde rename, so the wire key is
-    # `on_demand_enabled`; the client's own log context spells it `onDemandEnabled`. Accept either,
-    # but only an explicit false in every spelling present passes.
-    flags = [billing[k] for k in ("on_demand_enabled", "onDemandEnabled") if k in billing]
-    if not flags or any(f is not False for f in flags):
+    # The top-level response struct (BillingConfigResponse) has no serde rename, so the ACP wire key
+    # is `on_demand_enabled` (billing.rs); `onDemandEnabled` is only the client's log spelling. The
+    # wire key must be exactly false; the log spelling can only veto, never authorize.
+    if billing.get("on_demand_enabled") is not False or billing.get("onDemandEnabled", False) is not False:
         return False, ("on-demand (pay-as-you-go) billing is enabled or not reported; a subscription "
                        "reviewer could spend money past the included credits"), {}
     config = billing.get("config")
@@ -102,7 +102,7 @@ def decide(billing, pace=None, now=None):
     period = config.get("currentPeriod")
     if not isinstance(period, dict):
         return False, "currentPeriod missing", {}
-    kind = _PERIOD_TYPES.get(period.get("type"))
+    kind = _PERIOD_TYPES.get(period.get("type")) if isinstance(period.get("type"), str) else None
     if kind is None:
         return False, "currentPeriod type missing or unknown", {}
     try:

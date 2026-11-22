@@ -28,7 +28,7 @@ from pricing import PRICES, _PRICE_WINDOWS, dispatch_models  # noqa: F401
 from verdict import extract_verdict, has_new_contest, is_blocking, is_unresolved, newest_reply_id, overall_label, posts_review_thread, state_of, today
 from merge import changed_paths, decide_merge, read_paths
 import grok_billing
-from reviewers import GROK_CHECKOUT_CHANGED, GROK_TOOL_VIOLATION, build_prompt, ci_status_block, cleanup_rev_home, codex_model_unavailable, exact_grok_model, exact_kiro_model, reject_retired_opus, reviewer_env, run_claude, run_codex, run_grok, run_kiro, run_pi, sweep_rev_homes
+from reviewers import GROK_CHECKOUT_CHANGED, GROK_CHECKOUT_WRITABLE, GROK_CREDENTIAL_IN_OUTPUT, GROK_TOOL_VIOLATION, build_prompt, ci_status_block, cleanup_rev_home, codex_model_unavailable, exact_grok_model, exact_kiro_model, reject_retired_opus, reviewer_env, run_claude, run_codex, run_grok, run_kiro, run_pi, sweep_rev_homes
 from casefile import (build_reactivation_block, carry_forward, normalize_finding_path, patch_digest,
                       pick_anchor, seed_stale_approvals, update_case_file)
 from render import meta_block, render_contest_reply, render_scoreboard, render_thread, rubrics_fingerprint, thread_meta
@@ -104,7 +104,8 @@ _PROVIDER_DOWN_PHRASE = {
 # runner's configuration (or the CLI's), not a blip: the retry would spend a whole review again only
 # to fail closed again.
 # A pacing hold is the same: the credits will not have recovered seconds later, and an unreadable
-# usage read is a configuration fact. A changed checkout is a sandbox failure, never a blip.
+# usage read is a configuration fact. A sandbox failure (a changed or writable checkout, or the
+# login credential in the output) is never a blip either.
 NO_RETRY_KINDS = frozenset({"tool_set_violation", "pacing_hold", "sandbox_violation"})
 
 # Native CLI failures remain distinct from the model's structured review verdict.
@@ -127,7 +128,7 @@ def error_kind(res):
         return "tool_set_violation"
     if msg.startswith(grok_billing.GROK_PACING_HOLD):
         return "pacing_hold"
-    if msg.startswith(GROK_CHECKOUT_CHANGED):
+    if msg.startswith((GROK_CHECKOUT_CHANGED, GROK_CHECKOUT_WRITABLE, GROK_CREDENTIAL_IN_OUTPUT)):
         return "sandbox_violation"
     hay = f"{res.get('raw_stderr') or ''}\n{res.get('parse_error') or ''}\n{res.get('error_message') or ''}"
     for kind, pattern in _ERROR_KINDS:

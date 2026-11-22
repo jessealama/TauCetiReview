@@ -25,6 +25,14 @@ def test_exact_grok_model():
                 assert "grok-openrouter" in str(exc), str(exc)
 
 
+def private_dir():
+    """A temp dir OUTSIDE the system temp dirs: run_grok refuses a checkout under /tmp, which its
+    strict-based sandbox makes writable."""
+    base = os.path.join(os.path.expanduser("~"), ".tauceti-test")
+    os.makedirs(base, exist_ok=True)
+    return tempfile.mkdtemp(dir=base)
+
+
 def _stream(*events):
     return "\n".join(json.dumps(e) for e in events) + "\n"
 
@@ -47,7 +55,7 @@ def _run(stdout, returncode=0, stderr="", prompt="PROMPT"):
     """Run run_grok against a faked `sh`, returning (out, captured)."""
     captured = {}
     home = tempfile.mkdtemp()
-    repo = tempfile.mkdtemp()
+    repo = private_dir()
     os.makedirs(os.path.join(repo, "code"))
 
     def fake_sh(cmd, **kwargs):
@@ -79,7 +87,9 @@ def test_run_grok_command_shape():
     out, cap = _run(_stream(_READ_TOOLS_EVENT, {"type": "text", "data": "ok"}, _END))
     cmd = cap["cmd"]
     assert cmd[:2] == ["grok", "--prompt-file"], cmd
+    # Inside the throwaway GROK_HOME: readable under strict, and gone with the rev home.
     assert os.path.commonpath([cap["prompt_path"], cap["home"]]) == cap["home"]
+    assert os.path.dirname(cap["prompt_path"]) == os.path.join(cap["home"], ".grok")
     assert cap["prompt_at_call"].endswith("\n\nPROMPT")
     assert cap["repo"] in cap["prompt_at_call"].split("\n\n")[0]
     assert _flag(cmd, "-m") == "grok-4.7"
@@ -286,7 +296,7 @@ def _run_rubric(runner=None, env_error=None, billing=_PACED_OK):
     review.update_case_file = lambda *a, **k: {"author_replies": []}
     review.newest_reply_id = lambda *a, **k: None
     outdir = pathlib.Path(tempfile.mkdtemp())
-    tool_cwd = tempfile.mkdtemp()  # a private checkout: run_grok fingerprints it before and after
+    tool_cwd = private_dir()  # a private checkout: run_grok fingerprints it before and after
     a = argparse.Namespace(mode="commit", reply_rubric=None, rubrics_dir="/tmp", tool_cwd=tool_cwd,
                            code_path="code", repo="r", pr=1, archive_dir=None, dry_run=True, arm="production",
                            auth="subscription", submitted_by=None, base_sha=None, merge_base_sha=None,
