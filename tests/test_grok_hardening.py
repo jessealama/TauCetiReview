@@ -249,7 +249,7 @@ def test_sandbox_profile_is_strict_readonly_checkout_and_denies_existing_credent
             os.makedirs(os.path.join(real_home, p))
         checkout = os.path.join(tmp, "work")
         os.makedirs(checkout)
-        text = reviewers.grok_sandbox_toml(checkout, real_home=real_home, exe_chain=[])
+        text = reviewers.grok_sandbox_toml(checkout, real_home=real_home)
         assert text.startswith(f"[profiles.{reviewers.GROK_SANDBOX_PROFILE}]\n"), text
         assert 'extends = "strict"' in text and "restrict_network = true" in text
         assert f'read_only = ["{os.path.realpath(checkout)}"]' in text, text
@@ -271,24 +271,31 @@ def test_sandbox_profile_is_strict_readonly_checkout_and_denies_existing_credent
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-def test_deny_keeps_the_grok_executable_chain_reachable():
-    # The official installer: ~/.local/bin/grok -> ~/.grok/bin/grok -> ~/.grok/downloads/grok-<arch>.
+def test_grok_runs_from_a_staged_link_so_the_real_grok_home_is_denied_whole():
+    # The official installer: PATH grok -> ~/.grok/bin/grok -> ~/.grok/downloads/grok-<arch>.
     tmp = tempfile.mkdtemp()
     try:
-        home = os.path.join(tmp, "home")
-        for d in (".grok/bin", ".grok/downloads", ".grok/sessions", ".ssh"):
-            os.makedirs(os.path.join(home, d))
-        for f in (".grok/auth.json", ".grok/config.toml"):
-            open(os.path.join(home, f), "w").close()
-        chain = [os.path.join(home, ".local/bin/grok"), os.path.join(home, ".grok/bin/grok"),
-                 os.path.join(home, ".grok/downloads/grok-linux-x86_64")]
-        deny = reviewers._grok_deny_paths(home, chain)
-        g = lambda p: os.path.join(home, p)  # noqa: E731
-        assert g(".grok") not in deny and g(".grok/bin") not in deny and g(".grok/downloads") not in deny
-        for p in (".grok/auth.json", ".grok/config.toml", ".grok/sessions", ".ssh"):
-            assert g(p) in deny, (p, deny)
-        # Without grok under it, the whole directory is denied.
-        assert g(".grok") in reviewers._grok_deny_paths(home, ["/usr/bin/grok"])
+        real_home = os.path.join(tmp, "home")
+        downloads = os.path.join(real_home, ".grok", "downloads")
+        os.makedirs(downloads)
+        os.makedirs(os.path.join(real_home, ".grok", "bin"))
+        binary = os.path.join(downloads, "grok-linux-x86_64")
+        with open(binary, "w") as f:
+            f.write("#!/bin/sh\n")
+        os.chmod(binary, 0o755)
+        os.symlink(os.path.join("..", "downloads", "grok-linux-x86_64"),
+                   os.path.join(real_home, ".grok", "bin", "grok"))
+        rev = os.path.join(tmp, "rev")
+        env = {"HOME": rev, "GROK_HOME": os.path.join(rev, ".grok"),
+               "PATH": os.path.join(real_home, ".grok", "bin")}
+        staged = reviewers.grok_stage_exe(env)
+        assert staged == os.path.join(env["GROK_HOME"], "bin", "grok")
+        assert os.path.samefile(staged, binary) or open(staged).read() == open(binary).read()
+        assert os.access(staged, os.X_OK)
+        # ...and the profile denies the real ~/.grok as a whole, so later-created files are covered.
+        text = reviewers.grok_sandbox_toml(rev, real_home=real_home)
+        assert json.dumps(os.path.join(real_home, ".grok")) in text.split("deny = ", 1)[1]
+        assert reviewers.grok_stage_exe({"HOME": rev, "PATH": "/nonexistent"}) == "grok"
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

@@ -86,7 +86,7 @@ def _flag(cmd, flag):
 def test_run_grok_command_shape():
     out, cap = _run(_stream(_READ_TOOLS_EVENT, {"type": "text", "data": "ok"}, _END))
     cmd = cap["cmd"]
-    assert cmd[:2] == ["grok", "--prompt-file"], cmd
+    assert os.path.basename(cmd[0]) == "grok" and cmd[1] == "--prompt-file", cmd
     # Inside the throwaway GROK_HOME: readable under strict, and gone with the rev home.
     assert os.path.commonpath([cap["prompt_path"], cap["home"]]) == cap["home"]
     assert os.path.dirname(cap["prompt_path"]) == os.path.join(cap["home"], ".grok")

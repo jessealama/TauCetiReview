@@ -776,50 +776,33 @@ def _toml_str(s):
     return json.dumps(str(s))
 
 
-def _grok_exe_chain():
-    """Every path on the way from `grok` on PATH to the real binary (each symlink hop and target).
-    The official installer puts the binary under ~/.grok/downloads behind ~/.local/bin and
-    ~/.grok/bin symlinks, and bwrap must still be able to exec it."""
-    exe = shutil.which("grok")
-    chain, seen = [], set()
-    while exe and exe not in seen:
-        seen.add(exe)
-        chain.append(os.path.abspath(exe))
-        if not os.path.islink(exe):
-            break
-        exe = os.path.join(os.path.dirname(exe), os.readlink(exe))
-    if exe:
-        chain.append(os.path.realpath(exe))
-    return chain
+def grok_stage_exe(env):
+    """Hard-link (or copy) the real `grok` binary into the throwaway GROK_HOME/bin and return that
+    path, so the sandbox can deny the runner's real ~/.grok WHOLE: the official installer keeps the
+    binary at ~/.grok/downloads behind ~/.local/bin and ~/.grok/bin symlinks, and a deny over it
+    leaves bwrap unable to exec grok. A hard link shares the inode, which the path-level deny does not
+    mask. Returns plain "grok" when it is not on PATH (the run then fails as before)."""
+    exe = shutil.which("grok", path=env.get("PATH", ""))  # the reviewer env only, never os.environ
+    if not exe:
+        return "grok"
+    real = os.path.realpath(exe)
+    grok_home = env.get("GROK_HOME") or os.path.join(env["HOME"], ".grok")
+    bindir = os.path.join(grok_home, "bin")
+    os.makedirs(bindir, exist_ok=True)
+    staged = os.path.join(bindir, "grok")
+    try:
+        os.link(real, staged)
+    except OSError:
+        shutil.copy2(real, staged)
+    return staged
 
 
-def _grok_deny_paths(real_home, exe_chain):
-    """Existing credential paths under the real HOME. A listed directory that holds a hop of the
-    grok executable chain is not denied whole (bwrap could not exec grok); its other entries are,
-    one level down, and the entries on the chain stay reachable."""
-    def holds_exe(path):
-        return any(os.path.commonpath([path, e]) == path for e in exe_chain)
-
-    deny = []
-    for rel in GROK_DENY_HOME_PATHS:
-        path = os.path.join(real_home, rel)
-        if not os.path.lexists(path):
-            continue
-        if not holds_exe(path):
-            deny.append(path)
-            continue
-        for name in sorted(os.listdir(path)):
-            child = os.path.join(path, name)
-            if not holds_exe(child):
-                deny.append(child)
-    return deny
-
-
-def grok_sandbox_toml(checkout, real_home=None, exe_chain=None):
+def grok_sandbox_toml(checkout, real_home=None):
     """The `tauceti-review` profile: base `strict`, child network off, checkout read-only, the
     runner's existing credential paths denied."""
     real_home = real_home or os.path.expanduser("~")
-    deny = _grok_deny_paths(real_home, exe_chain if exe_chain is not None else _grok_exe_chain())
+    deny = [os.path.join(real_home, p) for p in GROK_DENY_HOME_PATHS
+            if os.path.lexists(os.path.join(real_home, p))]
     lines = [f"[profiles.{GROK_SANDBOX_PROFILE}]", 'extends = "strict"', "restrict_network = true",
              f"read_only = [{_toml_str(os.path.realpath(checkout))}]",
              "read_write = []",
@@ -938,7 +921,7 @@ def run_grok(prompt, cwd, model, env):
     prompt_file = os.path.join(env.get("GROK_HOME") or os.path.join(env["HOME"], ".grok"), "review-prompt.md")
     with open(prompt_file, "w", encoding="utf-8") as f:
         f.write(prompt)
-    cmd = ["grok", "--prompt-file", prompt_file,
+    cmd = [grok_stage_exe(env), "--prompt-file", prompt_file,
            "-m", model,
            "--output-format", "streaming-json",
            "--tools", ",".join(GROK_READ_TOOLS),
