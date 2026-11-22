@@ -803,8 +803,15 @@ def _main(cleanup):
     print(f"engine + rubrics: {repo_dir}"
           + (f" (pinned @ {a.rubrics_sha[:12]})" if a.rubrics_sha else ""), file=sys.stderr)
 
+    # A grok review cannot run on a checkout under the temp dirs: its `strict`-based sandbox makes
+    # /tmp, /var/tmp and $TMPDIR writable, and a custom profile cannot take that back, so the engine
+    # refuses such a checkout. Give it a fresh workspace under the home directory instead.
+    work_base = None
+    if "grok" in avail:
+        work_base = os.path.join(os.path.expanduser("~"), ".tauceti-work")
+        os.makedirs(work_base, exist_ok=True)
     work = pathlib.Path(a.workdir) if a.workdir else pathlib.Path(tempfile.mkdtemp(
-        prefix=f"tauceti-review-{a.pr}-"))
+        prefix=f"tauceti-review-{a.pr}-", dir=work_base))
     work.mkdir(parents=True, exist_ok=True)
     if not a.keep and not a.workdir:
         cleanup.callback(shutil.rmtree, work, ignore_errors=True)
