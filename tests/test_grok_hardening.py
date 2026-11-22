@@ -249,7 +249,7 @@ def test_sandbox_profile_is_strict_readonly_checkout_and_denies_existing_credent
             os.makedirs(os.path.join(real_home, p))
         checkout = os.path.join(tmp, "work")
         os.makedirs(checkout)
-        text = reviewers.grok_sandbox_toml(checkout, real_home=real_home)
+        text = reviewers.grok_sandbox_toml(checkout, real_home=real_home, exe_chain=[])
         assert text.startswith(f"[profiles.{reviewers.GROK_SANDBOX_PROFILE}]\n"), text
         assert 'extends = "strict"' in text and "restrict_network = true" in text
         assert f'read_only = ["{os.path.realpath(checkout)}"]' in text, text
@@ -267,6 +267,28 @@ def test_sandbox_profile_is_strict_readonly_checkout_and_denies_existing_credent
         if tomllib:
             prof = tomllib.loads(text)["profiles"][reviewers.GROK_SANDBOX_PROFILE]
             assert prof["extends"] == "strict" and prof["read_only"] == [os.path.realpath(checkout)]
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_deny_keeps_the_grok_executable_chain_reachable():
+    # The official installer: ~/.local/bin/grok -> ~/.grok/bin/grok -> ~/.grok/downloads/grok-<arch>.
+    tmp = tempfile.mkdtemp()
+    try:
+        home = os.path.join(tmp, "home")
+        for d in (".grok/bin", ".grok/downloads", ".grok/sessions", ".ssh"):
+            os.makedirs(os.path.join(home, d))
+        for f in (".grok/auth.json", ".grok/config.toml"):
+            open(os.path.join(home, f), "w").close()
+        chain = [os.path.join(home, ".local/bin/grok"), os.path.join(home, ".grok/bin/grok"),
+                 os.path.join(home, ".grok/downloads/grok-linux-x86_64")]
+        deny = reviewers._grok_deny_paths(home, chain)
+        g = lambda p: os.path.join(home, p)  # noqa: E731
+        assert g(".grok") not in deny and g(".grok/bin") not in deny and g(".grok/downloads") not in deny
+        for p in (".grok/auth.json", ".grok/config.toml", ".grok/sessions", ".ssh"):
+            assert g(p) in deny, (p, deny)
+        # Without grok under it, the whole directory is denied.
+        assert g(".grok") in reviewers._grok_deny_paths(home, ["/usr/bin/grok"])
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

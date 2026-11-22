@@ -129,7 +129,9 @@ GROK_READ_TOOLS = ("read_file", "grep", "list_dir")
 # non-retried `tool_set_violation` kind off it, read from error_message only (never from stderr).
 GROK_TOOL_VIOLATION = "grok exposed or called tools outside the read-only set"
 
-GROK_DENIED_TOOLS = ("run_terminal_cmd", "write", "search_replace", "web_search", "web_fetch",
+# `run_terminal_command` is Grok Build's real shell tool id (seen live in streaming-json tool_call
+# events, grok 1.0.92); `run_terminal_cmd` is kept from the original list in case of older builds.
+GROK_DENIED_TOOLS = ("run_terminal_command", "run_terminal_cmd", "write", "search_replace", "web_search", "web_fetch",
                      "search_tool", "use_tool", "task", "todo_write", "lsp", "monitor", "workflow",
                      "enter_plan_mode", "image_gen")
 
@@ -774,12 +776,50 @@ def _toml_str(s):
     return json.dumps(str(s))
 
 
-def grok_sandbox_toml(checkout, real_home=None):
+def _grok_exe_chain():
+    """Every path on the way from `grok` on PATH to the real binary (each symlink hop and target).
+    The official installer puts the binary under ~/.grok/downloads behind ~/.local/bin and
+    ~/.grok/bin symlinks, and bwrap must still be able to exec it."""
+    exe = shutil.which("grok")
+    chain, seen = [], set()
+    while exe and exe not in seen:
+        seen.add(exe)
+        chain.append(os.path.abspath(exe))
+        if not os.path.islink(exe):
+            break
+        exe = os.path.join(os.path.dirname(exe), os.readlink(exe))
+    if exe:
+        chain.append(os.path.realpath(exe))
+    return chain
+
+
+def _grok_deny_paths(real_home, exe_chain):
+    """Existing credential paths under the real HOME. A listed directory that holds a hop of the
+    grok executable chain is not denied whole (bwrap could not exec grok); its other entries are,
+    one level down, and the entries on the chain stay reachable."""
+    def holds_exe(path):
+        return any(os.path.commonpath([path, e]) == path for e in exe_chain)
+
+    deny = []
+    for rel in GROK_DENY_HOME_PATHS:
+        path = os.path.join(real_home, rel)
+        if not os.path.lexists(path):
+            continue
+        if not holds_exe(path):
+            deny.append(path)
+            continue
+        for name in sorted(os.listdir(path)):
+            child = os.path.join(path, name)
+            if not holds_exe(child):
+                deny.append(child)
+    return deny
+
+
+def grok_sandbox_toml(checkout, real_home=None, exe_chain=None):
     """The `tauceti-review` profile: base `strict`, child network off, checkout read-only, the
     runner's existing credential paths denied."""
     real_home = real_home or os.path.expanduser("~")
-    deny = [os.path.join(real_home, p) for p in GROK_DENY_HOME_PATHS
-            if os.path.lexists(os.path.join(real_home, p))]
+    deny = _grok_deny_paths(real_home, exe_chain if exe_chain is not None else _grok_exe_chain())
     lines = [f"[profiles.{GROK_SANDBOX_PROFILE}]", 'extends = "strict"', "restrict_network = true",
              f"read_only = [{_toml_str(os.path.realpath(checkout))}]",
              "read_write = []",

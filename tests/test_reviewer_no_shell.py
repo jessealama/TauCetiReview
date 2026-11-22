@@ -100,12 +100,12 @@ def comma_values(argv, flag):
 # Grok Build's ids for everything that runs, writes, delegates, or reaches the network. `use_tool`
 # is the MCP meta-tool dispatcher: a live streaming-json probe showed `--tools read_file,grep,list_dir`
 # alone still exposed it, so it must be explicitly denied.
-GROK_FORBIDDEN = {"run_terminal_cmd", "write", "search_replace", "web_search", "web_fetch",
+GROK_FORBIDDEN = {"run_terminal_command", "run_terminal_cmd", "write", "search_replace", "web_search", "web_fetch",
                   "search_tool", "use_tool", "task"}
 
 # The exact denylist the design fixes. Pinned by equality, not superset: dropping an entry, or
 # adding one silently, is a reviewed change to the boundary and must update this list.
-GROK_DENYLIST = {"run_terminal_cmd", "write", "search_replace", "web_search", "web_fetch",
+GROK_DENYLIST = {"run_terminal_command", "run_terminal_cmd", "write", "search_replace", "web_search", "web_fetch",
                  "search_tool", "use_tool", "task", "todo_write", "lsp", "monitor", "workflow",
                  "enter_plan_mode", "image_gen"}
 
