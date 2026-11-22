@@ -129,9 +129,11 @@ GROK_READ_TOOLS = ("read_file", "grep", "list_dir")
 # non-retried `tool_set_violation` kind off it, read from error_message only (never from stderr).
 GROK_TOOL_VIOLATION = "grok exposed or called tools outside the read-only set"
 
-# `run_terminal_command` is Grok Build's real shell tool id (seen live in streaming-json tool_call
-# events, grok 1.0.92); `run_terminal_cmd` is kept from the original list in case of older builds.
-GROK_DENIED_TOOLS = ("run_terminal_command", "run_terminal_cmd", "write", "search_replace", "web_search", "web_fetch",
+# These are --tools/--disallowed-tools ids. They are not always the names in streaming-json events:
+# live (grok 1.0.92) the shell tool is configured as `run_terminal_cmd` but its tool_call events say
+# `run_terminal_command`, and `--tools run_terminal_command` "names no tool". run_grok's event check
+# is an allowlist, so any event name outside GROK_READ_TOOLS fails closed whatever its spelling.
+GROK_DENIED_TOOLS = ("run_terminal_cmd", "write", "search_replace", "web_search", "web_fetch",
                      "search_tool", "use_tool", "task", "todo_write", "lsp", "monitor", "workflow",
                      "enter_plan_mode", "image_gen")
 
