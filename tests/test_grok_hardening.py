@@ -81,17 +81,41 @@ def test_decide_holds_when_exhausted_even_with_no_soft_cap():
     assert not ok and "exhausted" in reason, reason
 
 
-def test_decide_refuses_unless_on_demand_is_explicitly_false():
-    for kwargs in ({"on_demand": True}, {"on_demand": None}, {"key": None}, {"on_demand": "false"},
-                   {"on_demand": 0}):
+def test_decide_on_demand_flag_when_present_must_be_exactly_false():
+    for kwargs in ({"on_demand": True}, {"on_demand": None}, {"on_demand": "false"}, {"on_demand": 0},
+                   {"key": "onDemandEnabled", "on_demand": True}):
         ok, reason, _ = grok_billing.decide(_billing(**kwargs), pace="60:40", now=_at(0.5))
         assert not ok and "on-demand" in reason, (kwargs, reason)
-    # Only the ACP wire key can authorize; the log spelling alone cannot, but it can veto.
-    ok, _, _ = grok_billing.decide(_billing(key="onDemandEnabled"), pace="60:40", now=_at(0.5))
-    assert not ok
-    both = dict(_billing(), onDemandEnabled=True)
-    assert not grok_billing.decide(both, pace="60:40", now=_at(0.5))[0]
+    assert grok_billing.decide(_billing(), pace="60:40", now=_at(0.5))[0]
+    assert grok_billing.decide(_billing(key="onDemandEnabled"), pace="60:40", now=_at(0.5))[0]
+    # Every spelling present must say false.
+    assert not grok_billing.decide(dict(_billing(), onDemandEnabled=True), pace="60:40", now=_at(0.5))[0]
     assert grok_billing.decide(dict(_billing(), onDemandEnabled=False), pace="60:40", now=_at(0.5))[0]
+
+
+def test_decide_absent_flag_is_off_only_without_on_demand_fields():
+    # The live shape for an account with pay-as-you-go off: no flag, no on-demand fields.
+    assert grok_billing.decide(_billing(key=None), pace="60:40", now=_at(0.5))[0]
+    assert grok_billing.decide(dict(_billing(key=None), config=dict(_billing()["config"], history=[
+        {"billingCycle": {"year": 2026, "month": 10}, "includedUsed": {"val": 900}}])),
+        pace="60:40", now=_at(0.5))[0]
+    for field in ("onDemandCap", "onDemandUsed", "on_demand_cap", "on_demand_used"):
+        for value in ({"val": 500}, {}, None, 0):
+            b = _billing(key=None)
+            b["config"][field] = value
+            ok, reason, _ = grok_billing.decide(b, pace="60:40", now=_at(0.5))
+            assert not ok and "on-demand" in reason, (field, value)
+        b = _billing(key=None)
+        b["config"]["history"] = [{"includedUsed": {"val": 1}}, {field: {"val": 3}}]
+        assert not grok_billing.decide(b, pace="60:40", now=_at(0.5))[0], field
+    for bad_history in ("x", [1], [None]):
+        b = _billing(key=None)
+        b["config"]["history"] = bad_history
+        assert not grok_billing.decide(b, pace="60:40", now=_at(0.5))[0], bad_history
+    # A cap or usage field refuses even when the flag says false.
+    b = _billing(on_demand=False)
+    b["config"]["onDemandCap"] = {"val": 500}
+    assert not grok_billing.decide(b, pace="60:40", now=_at(0.5))[0], "an on-demand cap must refuse"
 
 
 def test_decide_fails_closed_on_malformed_responses():

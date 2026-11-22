@@ -12,10 +12,10 @@ fails closed: anything this module cannot parse, any missing field, or any doubt
 billing is a refusal, never "free".
 
 On-demand (pay-as-you-go) credit: when it is enabled, usage past the included allowance bills real
-money, which a subscription reviewer must never do. So a run is refused unless the response says
-on-demand is exactly `false` in the wire field `on_demand_enabled`; absent or null counts as enabled.
-That flag comes from the client's remote settings, so a cold agent that has not loaded them yet
-reads as null and is refused too.
+money, which a subscription reviewer must never do. So a run is refused unless on-demand is provably
+off: an `on_demand_enabled` flag, when present, must be exactly `false`; when the server omits it (as
+it does for some accounts with pay-as-you-go off), the credits config must carry no on-demand cap or
+usage field at all (see _on_demand_off).
 
 Run as a script (runner/ on sys.path), so imports are flat siblings, not package-relative."""
 
@@ -70,6 +70,31 @@ def pace_budget(curve, elapsed):
     return curve[-1][1]
 
 
+# Credits-config fields that only exist when on-demand credit is configured or has been used (proto3
+# JSON omits unset and zero values, so their mere presence is the signal).
+_ON_DEMAND_FIELDS = ("onDemandCap", "onDemandUsed", "on_demand_cap", "on_demand_used")
+
+
+def _on_demand_off(billing, config):
+    """True only when on-demand billing is provably off.
+
+    The flag comes from the client's remote settings and is omitted (serde `None`) for accounts the
+    server sends none for, which live reads show happens with pay-as-you-go off. So:
+    - flag present (either spelling): every spelling present must be exactly `false`;
+    - in every case, the credits config and every history row must carry no on-demand cap or usage
+      field at all. Any such field means on-demand is configured or was used: refuse, even when the
+      flag says false (the flag gates the UI controls; the fields are what can bill)."""
+    flags = [billing[k] for k in ("on_demand_enabled", "onDemandEnabled") if k in billing]
+    if any(f is not False for f in flags):
+        return False
+    if any(k in config for k in _ON_DEMAND_FIELDS):
+        return False
+    history = config.get("history", [])
+    if not isinstance(history, list):
+        return False
+    return not any(not isinstance(h, dict) or any(k in h for k in _ON_DEMAND_FIELDS) for h in history)
+
+
 def _parse_time(s):
     if not isinstance(s, str) or not s:
         raise ValueError("missing period timestamp")
@@ -90,12 +115,12 @@ def decide(billing, pace=None, now=None):
     # The top-level response struct (BillingConfigResponse) has no serde rename, so the ACP wire key
     # is `on_demand_enabled` (billing.rs); `onDemandEnabled` is only the client's log spelling. The
     # wire key must be exactly false; the log spelling can only veto, never authorize.
-    if billing.get("on_demand_enabled") is not False or billing.get("onDemandEnabled", False) is not False:
-        return False, ("on-demand (pay-as-you-go) billing is enabled or not reported; a subscription "
-                       "reviewer could spend money past the included credits"), {}
     config = billing.get("config")
     if not isinstance(config, dict):
         return False, "billing response has no config", {}
+    if not _on_demand_off(billing, config):
+        return False, ("on-demand (pay-as-you-go) billing is enabled, configured, or not provably off; "
+                       "a subscription reviewer could spend money past the included credits"), {}
     used = config.get("creditUsagePercent")
     if not isinstance(used, (int, float)) or isinstance(used, bool) or not 0 <= used <= 100:
         return False, "creditUsagePercent missing or out of range", {}
